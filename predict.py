@@ -167,28 +167,148 @@ class Predictor(BasePredictor):
             output_text = output_text.split(formatted_prompt, 1)[-1].strip()
 
         # Extract analysis and answer from harmony format
-        # The model outputs: <|start|>assistant<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...<|return|>
+        # The model outputs multiple possible formats:
+        # Format 1: <|start|>assistant<|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...<|return|>
+        # Format 2: Raw text with analysis content mixed in (fallback)
         analysis = ""
         answer = ""
         
-        # Try to extract analysis (reasoning) and final answer
-        analysis_match = re.search(r'<\|start\|>assistant<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>', output_text, re.DOTALL)
-        if analysis_match:
-            analysis = analysis_match.group(1).strip()
+        # Debug: Print raw output preview
+        print(f"DEBUG: Raw output preview (first 1000 chars):\n{output_text[:1000]}\n")
         
-        # Extract final answer
-        final_match = re.search(r'<\|start\|>assistant<\|channel\|>final<\|message\|>(.*?)(?:<\|return\||<\|end\||$)', output_text, re.DOTALL)
-        if final_match:
-            answer = final_match.group(1).strip()
-        elif not analysis_match:
-            # Fallback: if no format markers, use entire output as answer
-            answer = output_text.strip()
-            # Clean up any remaining special tokens
-            answer = re.sub(r'<\|[^|]+\|>', '', answer).strip()
+        # Pattern 1: Try proper harmony format markers first
+        # Analysis channel: <|start|>assistant<|channel|>analysis<|message|>content<|end|>
+        analysis_patterns = [
+            r'<\|start\|>assistant<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>',
+            r'<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>',
+            r'assistant<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>',
+        ]
         
-        # Clean up the answer by removing special tokens
-        answer = re.sub(r'<\|[^|]+\|>', '', answer).strip()
-        analysis = re.sub(r'<\|[^|]+\|>', '', analysis).strip()
+        for pattern in analysis_patterns:
+            analysis_match = re.search(pattern, output_text, re.DOTALL)
+            if analysis_match:
+                analysis = analysis_match.group(1).strip()
+                break
+        
+        # Final channel: <|start|>assistant<|channel|>final<|message|>content<|return|> or <|end|>
+        final_patterns = [
+            r'<\|start\|>assistant<\|channel\|>final<\|message\|>(.*?)(?:<\|return\||<\|end\||$)',
+            r'<\|channel\|>final<\|message\|>(.*?)(?:<\|return\||<\|end\||$)',
+            r'assistant<\|channel\|>final<\|message\|>(.*?)(?:<\|return\||<\|end\||$)',
+        ]
+        
+        for pattern in final_patterns:
+            final_match = re.search(pattern, output_text, re.DOTALL)
+            if final_match:
+                answer = final_match.group(1).strip()
+                break
+        
+        # Pattern 2: If no proper markers found, try to split on final channel marker
+        if not answer and '<|channel|>final' in output_text:
+            parts = output_text.split('<|channel|>final', 1)
+            if len(parts) == 2:
+                potential_analysis = parts[0]
+                potential_answer = parts[1]
+                # Extract content after <|message|> if present
+                if '<|message|>' in potential_answer:
+                    potential_answer = potential_answer.split('<|message|>', 1)[-1]
+                # Clean up answer end markers
+                potential_answer = re.sub(r'<\|return\||<\|end\||$', '', potential_answer, flags=re.DOTALL).strip()
+                if potential_answer:
+                    answer = potential_answer
+                # Extract analysis if present
+                if '<|channel|>analysis' in potential_analysis:
+                    analysis_match = re.search(r'<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>', potential_analysis, re.DOTALL)
+                    if analysis_match:
+                        analysis = analysis_match.group(1).strip()
+        
+        # Pattern 3: Handle case where output starts with "analysis" (text, not marker)
+        # This handles outputs like "analysisThe user says..." where analysis is part of content
+        if not analysis and not answer:
+            # Check if output starts with reasoning-like content
+            if output_text.lower().startswith('analysis') or 'analysis' in output_text[:100].lower():
+                # Try to find a natural split point - look for markers or transitions
+                # Option A: Look for <|channel|>final or similar markers
+                if '<|channel|>final' in output_text or '<|start|>assistant<|channel|>final' in output_text:
+                    # Split on final marker
+                    parts = re.split(r'<\|.*?channel.*?final.*?message.*?\|>', output_text, flags=re.IGNORECASE | re.DOTALL)
+                    if len(parts) >= 2:
+                        analysis = parts[0].strip()
+                        answer = parts[-1].strip()
+                # Option B: Look for transition phrases that suggest final answer
+                else:
+                    # Try to find where reasoning ends and answer begins
+                    # Common patterns: "Thus", "Therefore", "Conclusion", or double newline
+                    transition_patterns = [
+                        r'(.*?)(?:\n\n|Thus|Therefore|Conclusion|Final answer|Answer:)(.*)',
+                        r'(.*?)(<\|.*?final.*?\|>)(.*)',
+                    ]
+                    for pattern in transition_patterns:
+                        match = re.search(pattern, output_text, re.DOTALL | re.IGNORECASE)
+                        if match and len(match.groups()) >= 2:
+                            potential_analysis = match.group(1).strip()
+                            potential_answer = match.group(-1).strip()  # Last group
+                            if len(potential_answer) > 20:  # Ensure answer has content
+                                analysis = potential_analysis
+                                answer = potential_answer
+                                break
+        
+        # Pattern 4: Ultimate fallback - output doesn't have proper format
+        if not analysis and not answer:
+            # Check if it looks like reasoning content (long, explains process)
+            if len(output_text) > 200:
+                # Try to find where reasoning might end and answer begins
+                # Look for sentences that sound like conclusions
+                sentences = re.split(r'[.!?]\s+', output_text)
+                if len(sentences) > 3:
+                    # First 60% as analysis, last 40% as answer
+                    split_point = int(len(sentences) * 0.6)
+                    analysis = '. '.join(sentences[:split_point]) + '.'
+                    answer = '. '.join(sentences[split_point:]) + '.'
+                else:
+                    # Everything as answer if can't split meaningfully
+                    answer = output_text.strip()
+            else:
+                # Short output - everything as answer
+                answer = output_text.strip()
+        
+        # Clean up: Remove special tokens and markers
+        def clean_text(text):
+            if not text:
+                return ""
+            # Remove harmony format markers
+            text = re.sub(r'<\|[^|]+\|>', '', text)
+            # Remove leading "analysis" if it's just text (not a marker)
+            text = re.sub(r'^\s*analysis\s*:?\s*', '', text, flags=re.IGNORECASE)
+            # Clean up excessive whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
+        
+        analysis = clean_text(analysis)
+        answer = clean_text(answer)
+        
+        # Final safety: If answer still contains analysis content, try smarter split
+        if answer and not analysis and len(answer) > 300:
+            # Look for where analysis-like content (questions, reasoning) transitions to answer
+            # Find last occurrence of questioning/reasoning phrases
+            reasoning_indicators = [
+                r'(.*?)(?:We can|We need|But|However|Given|Looking at|The user)(.*)',
+            ]
+            for pattern in reasoning_indicators:
+                match = re.search(pattern, answer, re.DOTALL | re.IGNORECASE)
+                if match:
+                    potential_analysis = match.group(1).strip()
+                    potential_answer = match.group(2).strip()
+                    if len(potential_answer) > 50:  # Ensure answer has substantial content
+                        analysis = potential_analysis
+                        answer = potential_answer
+                        break
+        
+        print(f"DEBUG: Extracted analysis length: {len(analysis)}, answer length: {len(answer)}")
+        if analysis:
+            print(f"DEBUG: Analysis preview: {analysis[:200]}...")
+        if answer:
+            print(f"DEBUG: Answer preview: {answer[:200]}...")
         
         return {
             "analysis": analysis,
